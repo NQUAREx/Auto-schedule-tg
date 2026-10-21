@@ -252,7 +252,7 @@ async def existing_scheduled(app: Client, chat_id):
         return sorted(m.date for m in getattr(res, "messages", []) if getattr(m, "date", None))
     except Exception as e:
         print(f"  (не удалось получить уже отложенные сообщения: {e})")
-        return []
+        raise RuntimeError("Не удалось проверить отложенные сообщения") from e
 
 
 def fmt(dt: datetime) -> str:
@@ -267,11 +267,16 @@ async def main():
     api_hash = ask("api_hash: ")
     channel = clean_channel(ask("@имя канала: "))
     hours = ask_hours("Шаг между постами, часов (можно дробное, например 1.5): ")
-    folder = pick_folder()
-
-    files = list_images(folder)
-    if not files:
-        sys.exit(f"В папке {folder} нет изображений.")
+    mode = ask("Источник: 1 — галерея, 2 — Telegram-канал [1]: ") or "1"
+    while mode not in ("1", "2"):
+        mode = ask("Введите 1 или 2: ")
+    folder = pick_folder() if mode == "1" else None
+    files = list_images(folder) if folder else []
+    source_name = clean_channel(ask("@канал-источник или ID: ")) if mode == "2" else None
+    if folder and not files:
+        sys.exit("В папке нет изображений.")
+    if mode == "2" and not source_name:
+        sys.exit("Не указан канал-источник.")
     if not HAS_PIL:
         print("⚠ Pillow не установлен: файлы не в JPG/PNG конвертироваться не смогут.")
 
@@ -285,6 +290,20 @@ async def main():
         except RPCError as e:
             sys.exit(f"Не удалось найти «{channel}»: {err_code(e)}")
 
+        source = None
+        if mode == "2":
+            try:
+                source = await app.get_chat(int(source_name) if source_name.lstrip("-").isdigit() else source_name)
+                if source.id == chat.id:
+                    sys.exit("Источник и цель должны быть разными каналами.")
+                async for message in app.get_chat_history(source.id):
+                    if message.photo:
+                        files.append(message)
+                files.sort(key=lambda message: message.id)
+            except RPCError as e:
+                sys.exit(f"Ошибка чтения источника: {err_code(e)}")
+            if not files:
+                sys.exit("В источнике нет фотографий.")
         existing = await existing_scheduled(app, chat.id)
         free = SCHEDULE_LIMIT - len(existing)
         if free <= 0:
@@ -307,7 +326,7 @@ async def main():
 
         print("\n--- План ---")
         print(f"Канал:               {chat.title} (@{chat.username or channel})")
-        print(f"Файлов в папке:      {len(files)}")
+        print(f"Фотографий:         {len(files)}")
         print(f"Уже в отложке:       {len(existing)} (лимит ~{SCHEDULE_LIMIT}, свободно {free})")
         print(f"Шаг:                 {hours} ч")
         print(f"Первая публикация:   {fmt(start)}")
@@ -317,18 +336,24 @@ async def main():
         if not ask_yes("\nНачинать?"):
             return
 
-        sent_dir = folder / SENT_DIR_NAME
+        sent_dir = folder / SENT_DIR_NAME if folder else None
         slot = 0
         sent = 0
         skipped = []
         stop_reason = None
 
         for src in files:
+            if slot >= free:
+                stop_reason = "Лимит отложенных сообщений исчерпан."
+                break
             when = start + step * slot
             result = None
             while result is None:
                 try:
-                    await send_file(app, chat.id, src, when)
+                    if source:
+                        await app.copy_message(chat.id, source.id, src.id, schedule_date=when)
+                    else:
+                        await send_file(app, chat.id, src, when)
                     result = "ok"
                 except FloodWait as e:
                     wait = int(getattr(e, "value", 30)) + 1
@@ -347,8 +372,9 @@ async def main():
                         )
                     result = "stop"
                 except Exception as e:
-                    print(f"   ✗ пропускаю {src.name}: {e}")
-                    skipped.append(src.name)
+                    label = f"сообщение {src.id}" if source else src.name
+                    print(f"   ✗ пропускаю {label}: {e}")
+                    skipped.append(label)
                     result = "skip"
 
             if result == "stop":
@@ -358,8 +384,14 @@ async def main():
 
             sent += 1
             slot += 1
-            print(f"[{sent}/{planned}] {src.name} → {fmt(when)}")
-            if MOVE_SENT:
+            label = f"сообщение {src.id}" if source else src.name
+            print(f"[{sent}/{planned}] {label} → {fmt(when)}")
+            if source:
+                try:
+                    await app.delete_messages(source.id, src.id)
+                except RPCError as e:
+                    print(f"   Не удалось удалить исходное сообщение {src.id}: {err_code(e)}")
+            elif MOVE_SENT:
                 try:
                     move_sent(src, sent_dir)
                 except OSError as e:
