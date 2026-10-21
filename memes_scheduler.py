@@ -12,6 +12,7 @@ memes_scheduler.py
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -58,6 +59,7 @@ MOVE_SENT = True                 # False — не переносить файл�
 PAUSE_BETWEEN = 1.5              # пауза между запросами, сек (защита от флуда)
 SCHEDULE_LIMIT = 100             # лимит отложенных сообщений Telegram на чат
 SESSION_NAME = "memes_scheduler"  # имя файла сессии (создаётся рядом со скриптом)
+SETTINGS_PATH = Path(__file__).resolve().with_name("memes_scheduler_settings.json")
 # ----------------------------------------------------------------------------
 
 IMAGE_EXT = {
@@ -73,21 +75,53 @@ MAX_PHOTO_BYTES = 10 * 1024 * 1024
 
 
 # ----------------------------- ВВОД ДАННЫХ ----------------------------------
-def ask(prompt: str) -> str:
-    return input(prompt).strip()
+def load_settings():
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
-def ask_int(prompt: str) -> int:
+SETTINGS = load_settings()
+
+
+def remember(key: str, value: str):
+    SETTINGS[key] = value
+    temp = SETTINGS_PATH.with_suffix(".tmp")
+    try:
+        temp.write_text(json.dumps(SETTINGS, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, SETTINGS_PATH)
+        try:
+            SETTINGS_PATH.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        print(f"  Не удалось сохранить настройки: {e}")
+
+
+def ask(prompt: str, key: str = None) -> str:
+    previous = SETTINGS.get(key) if key else None
+    label = f"{prompt.rstrip()} [{previous}]: " if previous is not None else prompt
+    value = input(label).strip()
+    if not value and previous is not None:
+        return str(previous)
+    if key and value:
+        remember(key, value)
+    return value
+
+
+def ask_int(prompt: str, key: str = None) -> int:
     while True:
-        raw = ask(prompt)
+        raw = ask(prompt, key)
         if raw.isdigit():
             return int(raw)
         print("  Нужно целое число.")
 
 
-def ask_hours(prompt: str) -> float:
+def ask_hours(prompt: str, key: str = None) -> float:
     while True:
-        raw = ask(prompt).replace(",", ".")
+        raw = ask(prompt, key).replace(",", ".")
         try:
             val = float(raw)
             if val > 0:
@@ -97,11 +131,14 @@ def ask_hours(prompt: str) -> float:
         print("  Введите положительное число, например 6 или 1.5")
 
 
-def ask_yes(prompt: str, default: bool = True) -> bool:
+def ask_yes(prompt: str, default: bool = True, key: str = None) -> bool:
+    if key and key in SETTINGS:
+        default = SETTINGS[key] == "yes"
     raw = ask(prompt + (" [Y/n]: " if default else " [y/N]: ")).lower()
-    if not raw:
-        return default
-    return raw in ("y", "yes", "д", "да")
+    value = default if not raw else raw in ("y", "yes", "д", "да")
+    if key:
+        remember(key, "yes" if value else "no")
+    return value
 
 
 def clean_channel(raw: str) -> str:
@@ -146,19 +183,19 @@ def pick_folder() -> Path:
     found = find_album()
     if found:
         print(f"Найдена папка: {found}")
-        raw = ask("Enter — использовать её, или введите другой путь: ")
+        raw = ask("Enter — использовать её, или введите другой путь: ", "folder")
         if not raw:
             return found
     else:
         print(f"Папка «{ALBUM_NAME}» не найдена автоматически.")
         if not (Path.home() / "storage").exists():
             print("  Подсказка: выполните в Termux `termux-setup-storage` и разрешите доступ.")
-        raw = ask("Введите полный путь к папке с картинками: ")
+        raw = ask("Введите полный путь к папке с картинками: ", "folder")
     while True:
         p = Path(raw).expanduser()
         if isdir(p):
             return p
-        raw = ask("  Такой папки нет. Введите путь ещё раз: ")
+        raw = ask("  Такой папки нет. Введите путь ещё раз: ", "folder")
 
 
 def list_images(folder: Path):
@@ -263,16 +300,16 @@ def fmt(dt: datetime) -> str:
 async def main():
     print("=== Планировщик мемов в отложенные сообщения Telegram ===\n")
     print("api_id и api_hash: https://my.telegram.org → API development tools\n")
-    api_id = ask_int("api_id: ")
-    api_hash = ask("api_hash: ")
-    channel = clean_channel(ask("@имя канала: "))
-    hours = ask_hours("Шаг между постами, часов (можно дробное, например 1.5): ")
-    mode = ask("Источник: 1 — галерея, 2 — Telegram-канал [1]: ") or "1"
+    api_id = ask_int("api_id: ", "api_id")
+    api_hash = ask("api_hash: ", "api_hash")
+    channel = clean_channel(ask("@имя канала: ", "target_channel"))
+    hours = ask_hours("Шаг между постами, часов (можно дробное, например 1.5): ", "hours")
+    mode = ask("Источник: 1 — галерея, 2 — Telegram-канал: ", "mode") or "1"
     while mode not in ("1", "2"):
-        mode = ask("Введите 1 или 2: ")
+        mode = ask("Введите 1 или 2: ", "mode")
     folder = pick_folder() if mode == "1" else None
     files = list_images(folder) if folder else []
-    source_name = clean_channel(ask("@канал-источник или ID: ")) if mode == "2" else None
+    source_name = clean_channel(ask("@канал-источник или ID: ", "source_channel")) if mode == "2" else None
     if folder and not files:
         sys.exit("В папке нет изображений.")
     if mode == "2" and not source_name:
@@ -333,7 +370,7 @@ async def main():
         print(f"Последняя (прогноз): {fmt(last_planned)}")
         print(f"Будет запланировано: до {planned} шт.")
         print(f"Время показано по поясу Termux ({tz_label}); в Telegram оно будет по поясу устройства.")
-        if not ask_yes("\nНачинать?"):
+        if not ask_yes("\nНачинать?", key="confirm"):
             return
 
         sent_dir = folder / SENT_DIR_NAME if folder else None
