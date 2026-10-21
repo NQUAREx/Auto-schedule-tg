@@ -1,0 +1,5 @@
+memes_scheduler_settings.json
+memes_scheduler.session
+memes_scheduler.session-journal
+__pycache__/
+*.pyc
